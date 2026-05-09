@@ -1,0 +1,17 @@
+waypoint_follower:
+  ros__parameters:
+    waypoint_topic: "waypoint"
+    odom_topic: "/odometry_publisher"
+    cmd_vel_topic: "/cmd_vel_subscriber"
+    cmd_vel_frame_id: "base_link"
+    path_topic: "waypoint_path"
+
+    goal_tolerance: 0.5
+    desired_linear_velocity: 3.0
+    max_angular_velocity: 0.8
+    angular_gain: 1.0
+    waypoint_spacing: 1.0
+
+    use_waypoint_timestamps: true
+    min_linear_velocity: 0.5
+    max_linear_velocity: 3.0
