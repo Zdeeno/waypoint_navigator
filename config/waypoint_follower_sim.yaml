@@ -13,5 +13,5 @@ waypoint_follower:
     waypoint_spacing: 1.0
 
     use_waypoint_timestamps: true
-    min_linear_velocity: 0.5
+    min_linear_velocity: 1.0
     max_linear_velocity: 3.0

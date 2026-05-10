@@ -9,7 +9,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description() -> LaunchDescription:
     pkg_share = get_package_share_directory('waypoint_follower')
-    default_params = os.path.join(pkg_share, 'config', 'waypoint_follower.yaml')
+    default_params = os.path.join(pkg_share, 'config', 'waypoint_follower_sim.yaml')
 
     params_file = LaunchConfiguration('params_file')
     use_sim_time = LaunchConfiguration('use_sim_time')

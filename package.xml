@@ -5,7 +5,7 @@
   <version>0.0.1</version>
   <description>Buffers incoming waypoints and drives the robot along them by publishing Twist commands to cmd_vel using a NAV2-style pure pursuit controller.</description>
 
-  <maintainer email="cihalavalentyn@gmail.com">zdeeno</maintainer>
+  <maintainer email="rozsyzde@fel.cvut.cz">zdeeno</maintainer>
   <license>Apache-2.0</license>
 
   <exec_depend>rclpy</exec_depend>
