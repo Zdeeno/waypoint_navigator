@@ -15,3 +15,8 @@ waypoint_follower:
     use_waypoint_timestamps: true
     min_linear_velocity: 1.0
     max_linear_velocity: 3.0
+
+    # Pause motion until the integrated buffered path length (from the last
+    # reached waypoint through the buffer) reaches this many meters.
+    # 0.0 disables the gate; nonzero values throttle starts on short buffers.
+    minimal_following_distance: 4.0

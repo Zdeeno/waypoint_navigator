@@ -68,6 +68,9 @@ class WaypointFollower(Node):
         self.declare_parameter('use_waypoint_timestamps', True)
         self.declare_parameter('min_linear_velocity', 0.05)
         self.declare_parameter('max_linear_velocity', 0.8)
+        # Pause motion until the integrated path length from the last reached
+        # waypoint through the buffer is at least this large. 0 disables.
+        self.declare_parameter('minimal_following_distance', 0.0)
 
         self.waypoint_topic = self.get_parameter('waypoint_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
@@ -84,6 +87,8 @@ class WaypointFollower(Node):
             self.get_parameter('use_waypoint_timestamps').value)
         self.min_linear_velocity = float(self.get_parameter('min_linear_velocity').value)
         self.max_linear_velocity = float(self.get_parameter('max_linear_velocity').value)
+        self.minimal_following_distance = float(
+            self.get_parameter('minimal_following_distance').value)
 
         self.waypoint_buffer: Deque[PoseStamped] = deque()
         # Position of the last waypoint we accepted into the buffer (kept
@@ -94,6 +99,9 @@ class WaypointFollower(Node):
         # or the first odom we saw before any waypoint was reached.
         self._segment_start_pose: Optional[Pose] = None
         self._segment_start_time: Optional[Time] = None
+        # Path length from _segment_start_pose (or buffer[0] if no odom yet)
+        # through the buffer to its last entry. Maintained incrementally.
+        self._integrated_distance: float = 0.0
 
         self.create_subscription(
             PoseStamped, self.waypoint_topic, self._waypoint_callback,
@@ -124,6 +132,14 @@ class WaypointFollower(Node):
             if (euclidean_distance(self._last_accepted_wp_pose, msg.pose)
                     < self.waypoint_spacing):
                 return
+        # Extend the integrated path length before appending so buffer[-1]
+        # still refers to the previous tail.
+        if self.waypoint_buffer:
+            self._integrated_distance += euclidean_distance(
+                self.waypoint_buffer[-1].pose, msg.pose)
+        elif self._segment_start_pose is not None:
+            self._integrated_distance += euclidean_distance(
+                self._segment_start_pose, msg.pose)
         self.waypoint_buffer.append(msg)
         self._last_accepted_wp_pose = msg.pose
         self._publish_path()
@@ -140,6 +156,12 @@ class WaypointFollower(Node):
         if self._segment_start_pose is None:
             self._segment_start_pose = msg.pose.pose
             self._segment_start_time = Time.from_msg(msg.header.stamp)
+            # Catch up the integrated distance with the segment from the
+            # newly-known start to whatever was buffered before odom arrived.
+            if self.waypoint_buffer:
+                self._integrated_distance += euclidean_distance(
+                    self._segment_start_pose,
+                    self.waypoint_buffer[0].pose)
 
         self._control_step(msg)
 
@@ -185,6 +207,13 @@ class WaypointFollower(Node):
 
         if distance_to_target < self.goal_tolerance:
             reached = self.waypoint_buffer.popleft()
+            # Subtract the segment we just consumed before advancing
+            # _segment_start_pose, so the invariant is preserved.
+            if self._segment_start_pose is not None:
+                self._integrated_distance -= euclidean_distance(
+                    self._segment_start_pose, reached.pose)
+                if self._integrated_distance < 0.0:
+                    self._integrated_distance = 0.0
             self._segment_start_pose = reached.pose
             self._segment_start_time = Time.from_msg(reached.header.stamp)
             self.get_logger().info(
@@ -197,6 +226,15 @@ class WaypointFollower(Node):
                 self._stop()
                 self.get_logger().info('[ctrl] DONE — all waypoints reached, '
                                        'sent zero TwistStamped.')
+            return
+
+        if self._integrated_distance < self.minimal_following_distance:
+            self._stop()
+            self.get_logger().info(
+                f'[ctrl] GATED: integrated={self._integrated_distance:.2f} m '
+                f'< minimal_following_distance={self.minimal_following_distance:.2f} m, '
+                f'buffer={len(self.waypoint_buffer)} — holding still',
+                throttle_duration_sec=1.0)
             return
 
         desired_v = self._segment_desired_velocity(target)
@@ -219,7 +257,8 @@ class WaypointFollower(Node):
             f'| robot=({rx:.2f},{ry:.2f}) yaw={ryaw:+.1f}deg '
             f'| target=({tx:.2f},{ty:.2f}) bearing={bearing:+.1f}deg '
             f'heading_err={heading_err:+.1f}deg '
-            f'| dist={distance_to_target:.2f} desired_v={desired_v:.2f} '
+            f'| dist={distance_to_target:.2f} int_dist={self._integrated_distance:.2f} '
+            f'desired_v={desired_v:.2f} '
             f'subs={self.cmd_vel_pub.get_subscription_count()}')
 
         self._publish_cmd(cmd)
