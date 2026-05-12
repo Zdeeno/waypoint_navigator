@@ -48,6 +48,29 @@ def yaw_from_quaternion(q) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def transform_base_to_odom(pose_in_base: Pose, odom_pose: Pose) -> Pose:
+    """Compose T_odom_base · pose_in_base, planar (yaw-only) rotation.
+
+    Treats the incoming pose as expressed in base_link (camera ≡ base_link by
+    project assumption) and lifts it into the odometry frame using the most
+    recent odometry pose. Position is rotated by odom yaw and translated by
+    odom xyz; orientation is composed as yaw addition (matches the controller's
+    planar model — full 3D quaternion composition is unnecessary here).
+    """
+    yaw = yaw_from_quaternion(odom_pose.orientation)
+    c, s = math.cos(yaw), math.sin(yaw)
+    out = Pose()
+    out.position.x = odom_pose.position.x + c * pose_in_base.position.x - s * pose_in_base.position.y
+    out.position.y = odom_pose.position.y + s * pose_in_base.position.x + c * pose_in_base.position.y
+    out.position.z = odom_pose.position.z + pose_in_base.position.z
+    total_yaw = yaw + yaw_from_quaternion(pose_in_base.orientation)
+    out.orientation.x = 0.0
+    out.orientation.y = 0.0
+    out.orientation.z = math.sin(total_yaw / 2.0)
+    out.orientation.w = math.cos(total_yaw / 2.0)
+    return out
+
+
 class WaypointFollower(Node):
     def __init__(self) -> None:
         super().__init__('waypoint_follower')
@@ -102,6 +125,10 @@ class WaypointFollower(Node):
         # Path length from _segment_start_pose (or buffer[0] if no odom yet)
         # through the buffer to its last entry. Maintained incrementally.
         self._integrated_distance: float = 0.0
+        # Latest odometry pose + frame, cached for transforming incoming
+        # camera-frame waypoints into the odometry frame on receipt.
+        self._latest_odom_pose: Optional[Pose] = None
+        self._latest_odom_frame: str = ''
 
         self.create_subscription(
             PoseStamped, self.waypoint_topic, self._waypoint_callback,
@@ -124,6 +151,19 @@ class WaypointFollower(Node):
             f'  path (Path)              -> {self.path_topic}')
 
     def _waypoint_callback(self, msg: PoseStamped) -> None:
+        # Lift the waypoint from the camera/base frame into the odometry
+        # frame using the freshest odometry snapshot. Camera ≡ base_link by
+        # project assumption — no static camera-mount offset is applied.
+        # All downstream logic operates on the transformed pose.
+        if self._latest_odom_pose is None:
+            self.get_logger().warn(
+                f'[wp_cb] DROP: no odometry seen yet on {self.odom_topic}, '
+                f'cannot transform waypoint into odom frame',
+                throttle_duration_sec=2.0)
+            return
+        msg.pose = transform_base_to_odom(msg.pose, self._latest_odom_pose)
+        msg.header.frame_id = self._latest_odom_frame
+
         # Down-sample by spacing: drop any waypoint that is closer than
         # waypoint_spacing to the last accepted one. The first waypoint
         # always passes.
@@ -152,6 +192,10 @@ class WaypointFollower(Node):
                 f'frame={msg.header.frame_id!r} '
                 f'pos=({msg.pose.pose.position.x:.2f}, '
                 f'{msg.pose.pose.position.y:.2f})')
+
+        # Cache for the waypoint transform (camera/base → odom).
+        self._latest_odom_pose = msg.pose.pose
+        self._latest_odom_frame = msg.header.frame_id
 
         if self._segment_start_pose is None:
             self._segment_start_pose = msg.pose.pose
