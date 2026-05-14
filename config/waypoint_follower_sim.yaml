@@ -6,11 +6,11 @@ waypoint_follower:
     cmd_vel_frame_id: "base_link"
     path_topic: "waypoint_path"
 
-    goal_tolerance: 0.5
+    goal_tolerance: 0.8
     desired_linear_velocity: 3.0
     max_angular_velocity: 0.8
     angular_gain: 1.0
-    waypoint_spacing: 1.0
+    waypoint_spacing: 0.5
 
     use_waypoint_timestamps: true
     min_linear_velocity: 1.0
