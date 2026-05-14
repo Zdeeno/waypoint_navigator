@@ -1,6 +1,6 @@
 waypoint_follower:
   ros__parameters:
-    waypoint_topic: "waypoint"
+    marker_topic: "/whycode_node/markers"
     odom_topic: "/odometry_publisher"
     cmd_vel_topic: "/cmd_vel_subscriber"
     cmd_vel_frame_id: "base_link"

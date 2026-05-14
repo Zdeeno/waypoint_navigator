@@ -18,6 +18,7 @@ from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
+from whycode_interfaces.msg import MarkerArray
 
 
 def _best_effort(depth: int) -> QoSProfile:
@@ -75,7 +76,7 @@ class WaypointFollower(Node):
     def __init__(self) -> None:
         super().__init__('waypoint_follower')
 
-        self.declare_parameter('waypoint_topic', 'waypoint')
+        self.declare_parameter('marker_topic', '/whycode_node/markers')
         self.declare_parameter('odom_topic', 'odom')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('cmd_vel_frame_id', 'base_link')
@@ -95,7 +96,7 @@ class WaypointFollower(Node):
         # waypoint through the buffer is at least this large. 0 disables.
         self.declare_parameter('minimal_following_distance', 0.0)
 
-        self.waypoint_topic = self.get_parameter('waypoint_topic').value
+        self.marker_topic = self.get_parameter('marker_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
         self.cmd_vel_frame_id = self.get_parameter('cmd_vel_frame_id').value
@@ -131,7 +132,7 @@ class WaypointFollower(Node):
         self._latest_odom_frame: str = ''
 
         self.create_subscription(
-            PoseStamped, self.waypoint_topic, self._waypoint_callback,
+            MarkerArray, self.marker_topic, self._marker_callback,
             WAYPOINT_QOS)
         self.create_subscription(
             Odometry, self.odom_topic, self._odom_callback, ODOM_QOS)
@@ -144,26 +145,49 @@ class WaypointFollower(Node):
         self.get_logger().info(
             f'waypoint_follower ready (BEST_EFFORT QoS on all topics, '
             f'control runs on each odom message):\n'
-            f'  waypoints (PoseStamped)  <- {self.waypoint_topic}\n'
+            f'  markers (MarkerArray)    <- {self.marker_topic}\n'
             f'  odom (Odometry)          <- {self.odom_topic}\n'
             f'  cmd_vel (TwistStamped)   -> {self.cmd_vel_topic} '
             f'(frame_id={self.cmd_vel_frame_id!r})\n'
             f'  path (Path)              -> {self.path_topic}')
 
-    def _waypoint_callback(self, msg: PoseStamped) -> None:
-        # Lift the waypoint from the camera/base frame into the odometry
-        # frame using the freshest odometry snapshot. Camera ≡ base_link by
-        # project assumption — no static camera-mount offset is applied.
-        # All downstream logic operates on the transformed pose.
+    def _marker_callback(self, msg: MarkerArray) -> None:
+        # Whycode (and our test bag-replay) publishes detected markers in the
+        # camera frame, treated as base_link by project assumption. We lift
+        # them into the odometry frame using the freshest odometry snapshot
+        # before any other logic runs.
         if self._latest_odom_pose is None:
             self.get_logger().warn(
-                f'[wp_cb] DROP: no odometry seen yet on {self.odom_topic}, '
-                f'cannot transform waypoint into odom frame',
+                f'[mk_cb] DROP: no odometry seen yet on {self.odom_topic}',
                 throttle_duration_sec=2.0)
             return
-        msg.pose = transform_base_to_odom(msg.pose, self._latest_odom_pose)
-        msg.header.frame_id = self._latest_odom_frame
+        if not msg.markers:
+            return  # empty detection — silent skip
 
+        # Selection: at start-up we require an unambiguous single marker;
+        # once buffering has begun, pick the marker closest (in odom) to the
+        # last accepted waypoint to keep tracking on the same physical fiducial.
+        candidates = [transform_base_to_odom(m.position, self._latest_odom_pose)
+                      for m in msg.markers]
+        if self._last_accepted_wp_pose is None:
+            if len(candidates) != 1:
+                self.get_logger().info(
+                    f'[mk_cb] WAIT: {len(candidates)} markers visible at start — '
+                    f'need exactly 1 to begin buffering',
+                    throttle_duration_sec=2.0)
+                return
+            chosen = candidates[0]
+        else:
+            chosen = min(candidates,
+                         key=lambda p: euclidean_distance(p, self._last_accepted_wp_pose))
+
+        synth = PoseStamped()
+        synth.header.stamp = msg.header.stamp
+        synth.header.frame_id = self._latest_odom_frame
+        synth.pose = chosen
+        self._buffer_waypoint(synth)
+
+    def _buffer_waypoint(self, msg: PoseStamped) -> None:
         # Down-sample by spacing: drop any waypoint that is closer than
         # waypoint_spacing to the last accepted one. The first waypoint
         # always passes.
@@ -200,12 +224,6 @@ class WaypointFollower(Node):
         if self._segment_start_pose is None:
             self._segment_start_pose = msg.pose.pose
             self._segment_start_time = Time.from_msg(msg.header.stamp)
-            # Catch up the integrated distance with the segment from the
-            # newly-known start to whatever was buffered before odom arrived.
-            if self.waypoint_buffer:
-                self._integrated_distance += euclidean_distance(
-                    self._segment_start_pose,
-                    self.waypoint_buffer[0].pose)
 
         self._control_step(msg)
 
@@ -231,8 +249,8 @@ class WaypointFollower(Node):
     def _control_step(self, odom: Odometry) -> None:
         if not self.waypoint_buffer:
             self.get_logger().info(
-                f'[ctrl] BAIL: buffer empty, waiting for waypoints on '
-                f'{self.waypoint_topic}',
+                f'[ctrl] BAIL: buffer empty, waiting for markers on '
+                f'{self.marker_topic}',
                 throttle_duration_sec=2.0)
             return
 

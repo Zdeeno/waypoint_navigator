@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed the waypoint_follower with waypoints from a rosbag.
+"""Drive the waypoint_follower from a rosbag by mimicking whycode.
 
 Standalone test helper — NOT part of the package build. Run it manually
 after sourcing the workspace:
@@ -7,31 +7,62 @@ after sourcing the workspace:
     source install/setup.bash
     python3 testing/replay_bag.py /path/to/bag --odom-in-topic /recorded_odometry
 
-It reads a single Odometry topic from a rosbag2 directory and publishes
-each pose as a PoseStamped waypoint (preserving the original header
-stamps so the follower can derive segment velocity from them). The
-follower's buffer down-samples by its own ``waypoint_spacing`` parameter,
-so this script publishes everything verbatim.
+Reads a single Odometry topic from the bag and publishes each pose as a
+single-marker ``whycode_interfaces/MarkerArray`` on the same topic the real
+whycode_node uses. The marker pose is expressed in the live base_link frame
+(via the inverse of the most recent live odometry) so that the navigator's
+camera→odom transform reconstructs the original bagged pose.
 
-It does NOT publish odometry — the simulator is expected to provide the
-robot's pose feedback to the follower. Once the waypoints are sent the
-script exits; the follower keeps them in its buffer and drives toward
-them using sim odometry as feedback.
+Requires the simulator's odometry source to be running on the same topic
+the navigator subscribes to (``--live-odom-topic``).
 """
 
 import argparse
+import math
 import sys
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.serialization import deserialize_message
 from rosbag2_py import ConverterOptions, SequentialReader, StorageOptions
 from rosidl_runtime_py.utilities import get_message
+from whycode_interfaces.msg import Marker, MarkerArray
+
+
+def _best_effort(depth: int) -> QoSProfile:
+    return QoSProfile(
+        depth=depth,
+        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        history=QoSHistoryPolicy.KEEP_LAST,
+    )
+
+
+def _yaw_from_quaternion(q) -> float:
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _pose_in_base(pose_in_odom: Pose, robot_in_odom: Pose) -> Pose:
+    """Express an odom-frame pose in the robot's current base_link frame
+    (inverse of the planar rigid transform the navigator applies)."""
+    yaw = _yaw_from_quaternion(robot_in_odom.orientation)
+    c, s = math.cos(yaw), math.sin(yaw)
+    dx = pose_in_odom.position.x - robot_in_odom.position.x
+    dy = pose_in_odom.position.y - robot_in_odom.position.y
+    out = Pose()
+    out.position.x = c * dx + s * dy
+    out.position.y = -s * dx + c * dy
+    out.position.z = pose_in_odom.position.z - robot_in_odom.position.z
+    rel_yaw = _yaw_from_quaternion(pose_in_odom.orientation) - yaw
+    out.orientation.z = math.sin(rel_yaw / 2.0)
+    out.orientation.w = math.cos(rel_yaw / 2.0)
+    return out
 
 
 def _read_odometry(bag_path: str, topic: str) -> List[Tuple[int, Odometry]]:
@@ -58,24 +89,28 @@ def _read_odometry(bag_path: str, topic: str) -> List[Tuple[int, Odometry]]:
     return out
 
 
-def _to_waypoint(odom: Odometry) -> PoseStamped:
-    wp = PoseStamped()
-    wp.header = odom.header
-    wp.pose = odom.pose.pose
-    return wp
-
-
 class BagReplay(Node):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__('rosbag_replay')
         self.args = args
-        wp_qos = QoSProfile(
-            depth=200,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-        )
-        self.wp_pub = self.create_publisher(
-            PoseStamped, args.waypoint_topic, wp_qos)
+        self._latest_odom: Optional[Pose] = None
+        self.create_subscription(
+            Odometry, args.live_odom_topic, self._odom_cb, _best_effort(10))
+        self.markers_pub = self.create_publisher(
+            MarkerArray, args.marker_topic, _best_effort(200))
+
+    def _odom_cb(self, msg: Odometry) -> None:
+        self._latest_odom = msg.pose.pose
+
+    def _build_marker_array(self, bagged: Odometry) -> MarkerArray:
+        rel = _pose_in_base(bagged.pose.pose, self._latest_odom)
+        marker = Marker()
+        marker.position = rel
+        out = MarkerArray()
+        out.header.stamp = bagged.header.stamp
+        out.header.frame_id = 'base_link'
+        out.markers.append(marker)
+        return out
 
     def run(self) -> int:
         self.get_logger().info(f'Reading {self.args.bag} ...')
@@ -86,24 +121,33 @@ class BagReplay(Node):
             return 1
         self.get_logger().info(f'Loaded {len(messages)} odometry messages.')
 
-        waypoints = [_to_waypoint(odom) for _, odom in messages]
-
-        # Wait for the follower to subscribe before sending waypoints.
+        # Wait for both: a subscriber on the marker topic AND a first live
+        # odometry snapshot — we need the latter to compute base_link poses.
         deadline = time.monotonic() + self.args.subscriber_timeout
-        while (self.wp_pub.get_subscription_count() == 0
-               and time.monotonic() < deadline):
-            rclpy.spin_once(self, timeout_sec=0.1)
-        if self.wp_pub.get_subscription_count() == 0:
+        while time.monotonic() < deadline and (
+                self.markers_pub.get_subscription_count() == 0
+                or self._latest_odom is None):
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if self.markers_pub.get_subscription_count() == 0:
             self.get_logger().warn(
-                f'No subscriber on {self.args.waypoint_topic}; publishing anyway.')
+                f'No subscriber on {self.args.marker_topic}; publishing anyway.')
+        if self._latest_odom is None:
+            self.get_logger().error(
+                f'No live odometry on {self.args.live_odom_topic} after '
+                f'{self.args.subscriber_timeout}s; aborting.')
+            return 2
 
-        for wp in waypoints:
-            self.wp_pub.publish(wp)
-            time.sleep(0.02)
+        sent = 0
+        for _, bagged in messages:
+            if self._latest_odom is None:  # defensive — should not regress
+                rclpy.spin_once(self, timeout_sec=0.02)
+                continue
+            self.markers_pub.publish(self._build_marker_array(bagged))
+            sent += 1
+            rclpy.spin_once(self, timeout_sec=0.02)
         self.get_logger().info(
-            f'Sent {len(waypoints)} waypoints to {self.args.waypoint_topic}.')
-        # Brief grace period so the last messages drain before shutdown.
-        time.sleep(0.5)
+            f'Sent {sent} marker arrays to {self.args.marker_topic}.')
+        time.sleep(0.5)  # grace period before shutdown
         return 0
 
 
@@ -111,11 +155,14 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bag', help='Path to a rosbag2 directory.')
     parser.add_argument('--odom-in-topic', default='/odom',
-                        help='Odometry topic name inside the bag (used to derive waypoints).')
-    parser.add_argument('--waypoint-topic', default='waypoint',
-                        help='Topic to publish derived waypoints on.')
+                        help='Odometry topic name inside the bag (used to derive markers).')
+    parser.add_argument('--live-odom-topic', default='/odometry_publisher',
+                        help='Live odometry topic the navigator subscribes to '
+                             '(used to express each bagged pose in base_link).')
+    parser.add_argument('--marker-topic', default='/whycode_node/markers',
+                        help='Topic to publish synthesized MarkerArrays on.')
     parser.add_argument('--subscriber-timeout', type=float, default=5.0,
-                        help='Seconds to wait for a waypoint subscriber.')
+                        help='Seconds to wait for a marker subscriber and live odom.')
     args = parser.parse_args(argv)
 
     rclpy.init()
