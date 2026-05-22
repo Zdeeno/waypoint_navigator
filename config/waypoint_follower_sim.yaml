@@ -1,5 +1,11 @@
 waypoint_follower:
   ros__parameters:
+    # Control mode: "waypoints" buffers markers as a path and drives through
+    # them; "carrot" locks on to a single marker and follows it at a fixed
+    # standoff (never approaches closer than desired_carrot_distance, never
+    # backs up).
+    mode: "waypoints"
+
     marker_topic: "/whycode_node/markers"
     odom_topic: "/odometry_publisher"
     cmd_vel_topic: "/cmd_vel_subscriber"
@@ -20,3 +26,20 @@ waypoint_follower:
     # reached waypoint through the buffer) reaches this many meters.
     # 0.0 disables the gate; nonzero values throttle starts on short buffers.
     minimal_following_distance: 4.0
+
+    # Carrot-mode parameters (only used when mode: "carrot").
+    # Hold this many metres from the marker; never drive closer, never back up.
+    desired_carrot_distance: 2.0
+    # Marker detection-age beyond which the marker is treated as lost; on
+    # loss the robot drives to the last known position then aligns to the
+    # last known marker yaw.
+    marker_timeout: 1.0
+    # Yaw tolerance (rad) when finishing the lost-marker manoeuvre.
+    final_yaw_tolerance: 0.1
+    # Linear-velocity slew limits (m/s^2). linear_decel also drives the
+    # physics-correct stopping profile near the standoff:
+    # v_target = sqrt(2 * linear_decel * gap). Lower values = gentler ramps.
+    # With desired_linear_velocity=3.0 and linear_accel=0.6, going 0->3 m/s
+    # takes ~5 s and ~7.5 m. linear_decel=0.4 stops from 3 m/s in ~11 m.
+    linear_accel: 0.6
+    linear_decel: 0.4
