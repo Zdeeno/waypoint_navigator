@@ -1,11 +1,19 @@
 """Waypoint follower node.
 
-Buffers PoseStamped waypoints arriving on a topic and drives the robot through
-them by publishing geometry_msgs/TwistStamped to cmd_vel using a simple
-follow-the-carrot rule. Each odometry message triggers one control tick
-(compute heading error to the front-of-buffer waypoint, publish a TwistStamped),
-so the command rate matches the odom rate and the command always uses the
-freshest pose.
+Two control modes, selectable via the ``mode`` parameter:
+
+* ``waypoints`` (default) — buffers PoseStamped waypoints synthesised from
+  incoming markers and drives the robot through them by publishing
+  geometry_msgs/TwistStamped to cmd_vel using a simple follow-the-carrot rule.
+* ``carrot`` — locks on to a single marker and follows it like a carrot,
+  maintaining ``desired_carrot_distance`` at all times (never backs up). If
+  the marker disappears for longer than ``marker_timeout``, drives to the
+  last known marker position, rotates to the last known marker yaw, and
+  stops.
+
+In either mode, each odometry message triggers one control tick (compute the
+command, publish a TwistStamped), so the command rate matches the odom rate
+and the command always uses the freshest pose.
 """
 
 import math
@@ -76,6 +84,10 @@ class WaypointFollower(Node):
     def __init__(self) -> None:
         super().__init__('waypoint_follower')
 
+        # Mode: 'waypoints' (buffer markers as waypoints, follow them) or
+        # 'carrot' (lock on to one marker, follow it at a fixed standoff).
+        self.declare_parameter('mode', 'waypoints')
+
         self.declare_parameter('marker_topic', '/whycode_node/markers')
         self.declare_parameter('odom_topic', 'odom')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
@@ -96,6 +108,28 @@ class WaypointFollower(Node):
         # waypoint through the buffer is at least this large. 0 disables.
         self.declare_parameter('minimal_following_distance', 0.0)
 
+        # Carrot-mode parameters.
+        # Standoff distance to maintain from the marker; never drive closer
+        # than this and never back up if already inside it.
+        self.declare_parameter('desired_carrot_distance', 1.5)
+        # Time without any marker detection before the marker is treated as
+        # lost and we switch to "go to last known position" behaviour.
+        self.declare_parameter('marker_timeout', 1.0)
+        # Yaw tolerance (rad) when aligning to the last known marker yaw
+        # after the marker is lost — below this we declare the manoeuvre done.
+        self.declare_parameter('final_yaw_tolerance', 0.1)
+        # Linear velocity slew limits for the carrot mode (m/s^2). ``decel``
+        # also drives the physics-correct stopping profile near the standoff
+        # (v_target = sqrt(2 * decel * gap)).
+        self.declare_parameter('linear_accel', 0.5)
+        self.declare_parameter('linear_decel', 0.3)
+
+        self.mode = str(self.get_parameter('mode').value).lower()
+        if self.mode not in ('waypoints', 'carrot'):
+            self.get_logger().warn(
+                f"unknown mode={self.mode!r} — falling back to 'waypoints'")
+            self.mode = 'waypoints'
+
         self.marker_topic = self.get_parameter('marker_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
@@ -113,6 +147,13 @@ class WaypointFollower(Node):
         self.max_linear_velocity = float(self.get_parameter('max_linear_velocity').value)
         self.minimal_following_distance = float(
             self.get_parameter('minimal_following_distance').value)
+        self.desired_carrot_distance = float(
+            self.get_parameter('desired_carrot_distance').value)
+        self.marker_timeout = float(self.get_parameter('marker_timeout').value)
+        self.final_yaw_tolerance = float(
+            self.get_parameter('final_yaw_tolerance').value)
+        self.linear_accel = max(1e-3, float(self.get_parameter('linear_accel').value))
+        self.linear_decel = max(1e-3, float(self.get_parameter('linear_decel').value))
 
         self.waypoint_buffer: Deque[PoseStamped] = deque()
         # Position of the last waypoint we accepted into the buffer (kept
@@ -131,6 +172,18 @@ class WaypointFollower(Node):
         self._latest_odom_pose: Optional[Pose] = None
         self._latest_odom_frame: str = ''
 
+        # Carrot-mode state: the most recent marker pose in the odom frame,
+        # its yaw, and the wall-clock time of the last detection. ``None``
+        # until the first marker is seen.
+        self._carrot_pose: Optional[Pose] = None
+        self._carrot_yaw: float = 0.0
+        self._carrot_last_seen: Optional[Time] = None
+        # Slew-rate state for the carrot linear-velocity controller. We
+        # remember the last commanded linear velocity and the time it was
+        # published so we can clamp |dv/dt| to ``linear_accel`` / ``linear_decel``.
+        self._prev_linear_cmd: float = 0.0
+        self._prev_cmd_time: Optional[Time] = None
+
         self.create_subscription(
             MarkerArray, self.marker_topic, self._marker_callback,
             WAYPOINT_QOS)
@@ -143,7 +196,8 @@ class WaypointFollower(Node):
             Path, self.path_topic, PATH_QOS)
 
         self.get_logger().info(
-            f'waypoint_follower ready (BEST_EFFORT QoS on all topics, '
+            f'waypoint_follower ready (mode={self.mode!r}, '
+            f'BEST_EFFORT QoS on all topics, '
             f'control runs on each odom message):\n'
             f'  markers (MarkerArray)    <- {self.marker_topic}\n'
             f'  odom (Odometry)          <- {self.odom_topic}\n'
@@ -164,22 +218,37 @@ class WaypointFollower(Node):
         if not msg.markers:
             return  # empty detection — silent skip
 
+        # Selection reference: the last thing we locked onto. For waypoints
+        # mode that's the last accepted waypoint, for carrot mode it's the
+        # current carrot pose. ``None`` means we have not locked on yet.
+        if self.mode == 'carrot':
+            lock_ref = self._carrot_pose
+        else:
+            lock_ref = self._last_accepted_wp_pose
+
         # Selection: at start-up we require an unambiguous single marker;
-        # once buffering has begun, pick the marker closest (in odom) to the
-        # last accepted waypoint to keep tracking on the same physical fiducial.
+        # once tracking has begun, pick the marker closest (in odom) to the
+        # last lock-on reference to stay on the same physical fiducial.
         candidates = [transform_base_to_odom(m.position, self._latest_odom_pose)
                       for m in msg.markers]
-        if self._last_accepted_wp_pose is None:
+        if lock_ref is None:
             if len(candidates) != 1:
                 self.get_logger().info(
                     f'[mk_cb] WAIT: {len(candidates)} markers visible at start — '
-                    f'need exactly 1 to begin buffering',
+                    f'need exactly 1 to lock on',
                     throttle_duration_sec=2.0)
                 return
             chosen = candidates[0]
         else:
             chosen = min(candidates,
-                         key=lambda p: euclidean_distance(p, self._last_accepted_wp_pose))
+                         key=lambda p: euclidean_distance(p, lock_ref))
+
+        if self.mode == 'carrot':
+            self._carrot_pose = chosen
+            self._carrot_yaw = yaw_from_quaternion(chosen.orientation)
+            self._carrot_last_seen = self.get_clock().now()
+            self._publish_carrot_path()
+            return
 
         synth = PoseStamped()
         synth.header.stamp = msg.header.stamp
@@ -236,6 +305,19 @@ class WaypointFollower(Node):
         path.poses = list(self.waypoint_buffer)
         self.path_pub.publish(path)
 
+    def _publish_carrot_path(self) -> None:
+        """Publish the current carrot as a single-pose Path (for rviz)."""
+        if self._carrot_pose is None:
+            return
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = self._latest_odom_frame or 'map'
+        pose_stamped = PoseStamped()
+        pose_stamped.header = path.header
+        pose_stamped.pose = self._carrot_pose
+        path.poses = [pose_stamped]
+        self.path_pub.publish(path)
+
     def _publish_cmd(self, twist: Twist) -> None:
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -247,6 +329,10 @@ class WaypointFollower(Node):
         self._publish_cmd(Twist())
 
     def _control_step(self, odom: Odometry) -> None:
+        if self.mode == 'carrot':
+            self._control_step_carrot(odom)
+            return
+
         if not self.waypoint_buffer:
             self.get_logger().info(
                 f'[ctrl] BAIL: buffer empty, waiting for markers on '
@@ -350,6 +436,157 @@ class WaypointFollower(Node):
         v = seg_dist / (dt_ns * 1e-9)
         return max(self.min_linear_velocity, min(self.max_linear_velocity, v))
 
+    def _carrot_target_velocity(
+        self, remaining_distance: float, heading_error: float
+    ) -> float:
+        """Forward velocity that brings the robot to rest in
+        ``remaining_distance`` metres, capped at ``desired_linear_velocity``
+        and rolled off by cos(heading_error).
+
+        Uses v = sqrt(2 * linear_decel * remaining_distance) — the largest
+        speed from which we can still stop within ``remaining_distance`` at a
+        constant deceleration of ``linear_decel``. This gives a smooth,
+        physics-correct approach: cruise far from the goal, ramp down as we
+        close in, hit zero exactly at the stop point.
+        """
+        if remaining_distance <= 0.0:
+            return 0.0
+        v_decel = math.sqrt(2.0 * self.linear_decel * remaining_distance)
+        v = min(self.desired_linear_velocity, v_decel)
+        return v * max(0.0, math.cos(heading_error))
+
+    def _slew_linear(self, target_v: float, dt: float) -> float:
+        """Clamp |dv/dt| to ``linear_accel`` (speeding up) or
+        ``linear_decel`` (slowing down), starting from ``_prev_linear_cmd``."""
+        if dt <= 0.0:
+            return self._prev_linear_cmd
+        if target_v > self._prev_linear_cmd:
+            step = min(target_v - self._prev_linear_cmd, self.linear_accel * dt)
+            return self._prev_linear_cmd + step
+        step = min(self._prev_linear_cmd - target_v, self.linear_decel * dt)
+        return self._prev_linear_cmd - step
+
+    def _control_step_carrot(self, odom: Odometry) -> None:
+        """Carrot mode: follow the latest marker at a fixed standoff.
+
+        While the marker is visible, hold ``desired_carrot_distance`` (never
+        drive closer, never back up). If the marker is lost for longer than
+        ``marker_timeout``, drive to the last known marker position, rotate
+        to the last known marker yaw, then stop.
+
+        Linear velocity is shaped by a sqrt(2·decel·gap) profile and then
+        slew-limited by ``linear_accel`` / ``linear_decel`` for smooth
+        accel/decel.
+        """
+        if self._carrot_pose is None or self._carrot_last_seen is None:
+            # No carrot yet — keep the slew state zeroed so we restart cleanly
+            # the moment a marker shows up.
+            self._prev_linear_cmd = 0.0
+            self._prev_cmd_time = None
+            self._stop()
+            self.get_logger().info(
+                f'[ctrl/carrot] WAIT: no marker seen yet on {self.marker_topic}',
+                throttle_duration_sec=2.0)
+            return
+
+        robot_pose = odom.pose.pose
+        target = self._carrot_pose
+        distance_to_target = euclidean_distance(robot_pose, target)
+
+        # Frame sanity check — math assumes both are in the same frame.
+        odom_frame = odom.header.frame_id
+        if (self._latest_odom_frame and odom_frame
+                and odom_frame != self._latest_odom_frame):
+            self.get_logger().warn(
+                f'[ctrl/carrot] FRAME MISMATCH: odom in {odom_frame!r}, '
+                f'carrot lifted using {self._latest_odom_frame!r}',
+                throttle_duration_sec=5.0)
+
+        now = self.get_clock().now()
+        age_s = (now - self._carrot_last_seen).nanoseconds * 1e-9
+        marker_lost = age_s > self.marker_timeout
+
+        if self._prev_cmd_time is None:
+            dt = 0.0
+        else:
+            dt = (now - self._prev_cmd_time).nanoseconds * 1e-9
+            if dt < 0.0:
+                dt = 0.0
+        self._prev_cmd_time = now
+
+        ryaw = yaw_from_quaternion(robot_pose.orientation)
+        bearing = math.atan2(
+            target.position.y - robot_pose.position.y,
+            target.position.x - robot_pose.position.x,
+        )
+        heading_error = math.atan2(
+            math.sin(bearing - ryaw), math.cos(bearing - ryaw))
+
+        target_w = max(
+            -self.max_angular_velocity,
+            min(self.max_angular_velocity, self.angular_gain * heading_error),
+        )
+
+        if not marker_lost:
+            # Marker visible: stop at the standoff (never closer, never back).
+            gap = distance_to_target - self.desired_carrot_distance
+            if gap > 0.0:
+                target_v = self._carrot_target_velocity(gap, heading_error)
+                phase = 'FOLLOW'
+            else:
+                target_v = 0.0
+                phase = 'HOLD'
+        else:
+            # Marker lost: drive to the last known position, then rotate to
+            # the last known marker yaw, then stop.
+            if distance_to_target > self.goal_tolerance:
+                target_v = self._carrot_target_velocity(
+                    distance_to_target, heading_error)
+                phase = 'LOST_APPROACH'
+            else:
+                target_v = 0.0
+                yaw_error = math.atan2(
+                    math.sin(self._carrot_yaw - ryaw),
+                    math.cos(self._carrot_yaw - ryaw))
+                if abs(yaw_error) > self.final_yaw_tolerance:
+                    target_w = max(
+                        -self.max_angular_velocity,
+                        min(self.max_angular_velocity,
+                            self.angular_gain * yaw_error),
+                    )
+                    phase = 'LOST_ALIGN'
+                else:
+                    target_w = 0.0
+                    phase = 'LOST_DONE'
+
+        # Apply linear slew limit so accel/decel never exceed the configured
+        # rates, regardless of phase transitions.
+        v_cmd = self._slew_linear(target_v, dt)
+        self._prev_linear_cmd = v_cmd
+
+        cmd = Twist()
+        cmd.linear.x = v_cmd
+        cmd.angular.z = target_w
+
+        rx = robot_pose.position.x
+        ry = robot_pose.position.y
+        tx = target.position.x
+        ty = target.position.y
+        self.get_logger().info(
+            f'[ctrl/carrot:{phase}] PUB cmd_vel '
+            f'lin={cmd.linear.x:+.3f} (tgt={target_v:+.3f}) '
+            f'ang={cmd.angular.z:+.3f} '
+            f'| robot=({rx:.2f},{ry:.2f}) yaw={math.degrees(ryaw):+.1f}deg '
+            f'| target=({tx:.2f},{ty:.2f}) '
+            f'bearing={math.degrees(bearing):+.1f}deg '
+            f'heading_err={math.degrees(heading_error):+.1f}deg '
+            f'| dist={distance_to_target:.2f} '
+            f'standoff={self.desired_carrot_distance:.2f} '
+            f'marker_age={age_s:.2f}s lost={marker_lost} '
+            f'subs={self.cmd_vel_pub.get_subscription_count()}')
+
+        self._publish_cmd(cmd)
+
     def _compute_carrot_cmd(
         self,
         robot_pose: Pose,
@@ -372,7 +609,8 @@ class WaypointFollower(Node):
             target.pose.position.y - robot_pose.position.y,
             target.pose.position.x - robot_pose.position.x,
         )
-        heading_error = -math.atan2(
+        # TODO: Sim vs Helhest sign
+        heading_error = math.atan2(
             math.sin(bearing - ryaw), math.cos(bearing - ryaw))
 
         cmd = Twist()
