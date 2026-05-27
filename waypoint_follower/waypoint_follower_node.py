@@ -17,15 +17,19 @@ and the command always uses the freshest pose.
 """
 
 import math
+import threading
 from collections import deque
 from typing import Deque, Optional
 
 import rclpy
 from geometry_msgs.msg import Pose, PoseStamped, Twist, TwistStamped
 from nav_msgs.msg import Odometry, Path
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
+from std_srvs.srv import SetBool, Trigger
 from whycode_interfaces.msg import MarkerArray
 
 
@@ -124,6 +128,19 @@ class WaypointFollower(Node):
         self.declare_parameter('linear_accel', 0.5)
         self.declare_parameter('linear_decel', 0.3)
 
+        # Whether marker following is active at startup. The ELROB mission
+        # launches with this False so the robot does nothing until the
+        # operator's mission node enables it; standalone/sim use keeps True.
+        self.declare_parameter('enabled_on_start', True)
+        # In-place turn (``~/turn_in_place`` service) dynamics. Robot-side,
+        # closed-loop on odom: rotate by ``action_rotate_deg`` (degrees) at
+        # ``turn_speed`` (sign sets direction) until within ``turn_tolerance``
+        # (rad), aborting after ``turn_timeout`` seconds.
+        self.declare_parameter('action_rotate_deg', 180.0)
+        self.declare_parameter('turn_speed', 0.5)
+        self.declare_parameter('turn_tolerance', 0.1)
+        self.declare_parameter('turn_timeout', 30.0)
+
         self.mode = str(self.get_parameter('mode').value).lower()
         if self.mode not in ('waypoints', 'carrot'):
             self.get_logger().warn(
@@ -154,6 +171,13 @@ class WaypointFollower(Node):
             self.get_parameter('final_yaw_tolerance').value)
         self.linear_accel = max(1e-3, float(self.get_parameter('linear_accel').value))
         self.linear_decel = max(1e-3, float(self.get_parameter('linear_decel').value))
+        # action_rotate_deg is configured in degrees; keep a radian working
+        # value for the odom-based comparison.
+        self.action_rotate_deg = float(self.get_parameter('action_rotate_deg').value)
+        self.turn_angle = math.radians(self.action_rotate_deg)
+        self.turn_speed = float(self.get_parameter('turn_speed').value)
+        self.turn_tolerance = float(self.get_parameter('turn_tolerance').value)
+        self.turn_timeout = float(self.get_parameter('turn_timeout').value)
 
         self.waypoint_buffer: Deque[PoseStamped] = deque()
         # Position of the last waypoint we accepted into the buffer (kept
@@ -184,28 +208,133 @@ class WaypointFollower(Node):
         self._prev_linear_cmd: float = 0.0
         self._prev_cmd_time: Optional[Time] = None
 
+        # Marker following can be toggled at runtime via ~/enable_following;
+        # the ELROB mission node gates following this way.
+        self._following_enabled = bool(self.get_parameter('enabled_on_start').value)
+
+        # In-place turn state. The blocking ~/turn_in_place service handler
+        # waits on _turn_done_event while the odom-driven control path runs
+        # the rotation and sets the event on completion.
+        self._turning = False
+        self._turn_accumulated = 0.0
+        self._prev_turn_yaw: Optional[float] = None
+        self._turn_done_event = threading.Event()
+
+        # Odom/control run in their own mutually-exclusive group; the turn
+        # service is reentrant so it can block on the event while the odom
+        # callback keeps firing (requires the MultiThreadedExecutor in main).
+        self._odom_cbg = MutuallyExclusiveCallbackGroup()
+        self._turn_cbg = ReentrantCallbackGroup()
+
         self.create_subscription(
             MarkerArray, self.marker_topic, self._marker_callback,
             WAYPOINT_QOS)
         self.create_subscription(
-            Odometry, self.odom_topic, self._odom_callback, ODOM_QOS)
+            Odometry, self.odom_topic, self._odom_callback, ODOM_QOS,
+            callback_group=self._odom_cbg)
 
         self.cmd_vel_pub = self.create_publisher(
             TwistStamped, self.cmd_vel_topic, CMD_VEL_QOS)
         self.path_pub = self.create_publisher(
             Path, self.path_topic, PATH_QOS)
 
+        self.enable_following_srv = self.create_service(
+            SetBool, '~/enable_following', self._enable_following_cb)
+        self.turn_in_place_srv = self.create_service(
+            Trigger, '~/turn_in_place', self._turn_in_place_cb,
+            callback_group=self._turn_cbg)
+
         self.get_logger().info(
             f'waypoint_follower ready (mode={self.mode!r}, '
-            f'BEST_EFFORT QoS on all topics, '
+            f'following_enabled={self._following_enabled}, '
             f'control runs on each odom message):\n'
             f'  markers (MarkerArray)    <- {self.marker_topic}\n'
             f'  odom (Odometry)          <- {self.odom_topic}\n'
             f'  cmd_vel (TwistStamped)   -> {self.cmd_vel_topic} '
             f'(frame_id={self.cmd_vel_frame_id!r})\n'
-            f'  path (Path)              -> {self.path_topic}')
+            f'  path (Path)              -> {self.path_topic}\n'
+            f'  services: ~/enable_following (SetBool), ~/turn_in_place (Trigger)')
+
+    def _enable_following_cb(self, request: SetBool.Request,
+                             response: SetBool.Response) -> SetBool.Response:
+        self._following_enabled = bool(request.data)
+        if not self._following_enabled:
+            # Release control and drop any lock so re-enabling re-locks cleanly.
+            self._stop()
+            self._carrot_pose = None
+            self._carrot_last_seen = None
+            self._last_accepted_wp_pose = None
+            self.waypoint_buffer.clear()
+            self._integrated_distance = 0.0
+            self._prev_linear_cmd = 0.0
+            self._prev_cmd_time = None
+        response.success = True
+        response.message = (
+            f"following {'enabled' if self._following_enabled else 'disabled'}")
+        self.get_logger().info(f'[srv] {response.message}')
+        return response
+
+    def _turn_in_place_cb(self, request: Trigger.Request,
+                          response: Trigger.Response) -> Trigger.Response:
+        """Blocking 180°-style turn. Kicks off the odom-driven rotation and
+        waits for it to finish (or time out). Runs in a reentrant group so the
+        odom callback keeps firing while we wait."""
+        if self._latest_odom_pose is None:
+            response.success = False
+            response.message = f'no odometry yet on {self.odom_topic}'
+            self.get_logger().warn(f'[turn] reject: {response.message}')
+            return response
+        # Arm the turn; the control path picks it up on the next odom message.
+        self._turn_accumulated = 0.0
+        self._prev_turn_yaw = None
+        self._turn_done_event.clear()
+        self._turning = True
+        self.get_logger().info(
+            f'[turn] start: rotating {self.action_rotate_deg:.0f}deg '
+            f'at {self.turn_speed:+.2f} rad/s')
+        completed = self._turn_done_event.wait(timeout=self.turn_timeout)
+        if not completed:
+            self._turning = False
+            self._stop()
+            response.success = False
+            response.message = (
+                f'turn timed out after {self.turn_timeout:.1f}s '
+                f'({math.degrees(self._turn_accumulated):.0f}deg of '
+                f'{self.action_rotate_deg:.0f}deg)')
+            self.get_logger().warn(f'[turn] {response.message}')
+            return response
+        response.success = True
+        response.message = f'turn complete ({math.degrees(self._turn_accumulated):.0f}deg)'
+        self.get_logger().info(f'[turn] {response.message}')
+        return response
+
+    def _step_turn(self, odom: Odometry) -> None:
+        """Integrate wrapped yaw delta and rotate at turn_speed until the
+        target angle is reached, then stop and signal the service handler."""
+        ryaw = yaw_from_quaternion(odom.pose.pose.orientation)
+        if self._prev_turn_yaw is None:
+            self._prev_turn_yaw = ryaw
+        else:
+            d = math.atan2(math.sin(ryaw - self._prev_turn_yaw),
+                           math.cos(ryaw - self._prev_turn_yaw))
+            self._turn_accumulated += abs(d)
+            self._prev_turn_yaw = ryaw
+
+        if self._turn_accumulated >= self.turn_angle - self.turn_tolerance:
+            self._stop()
+            self._turning = False
+            self._turn_done_event.set()
+            return
+
+        cmd = Twist()
+        cmd.angular.z = self.turn_speed
+        self._publish_cmd(cmd)
 
     def _marker_callback(self, msg: MarkerArray) -> None:
+        # Ignore markers while following is disabled or an in-place turn is
+        # in progress — nothing should lock on or drive in those states.
+        if not self._following_enabled or self._turning:
+            return
         # Whycode (and our test bag-replay) publishes detected markers in the
         # camera frame, treated as base_link by project assumption. We lift
         # them into the odometry frame using the freshest odometry snapshot
@@ -329,6 +458,16 @@ class WaypointFollower(Node):
         self._publish_cmd(Twist())
 
     def _control_step(self, odom: Odometry) -> None:
+        # An in-place turn takes precedence over everything and runs
+        # independently of the following-enabled flag.
+        if self._turning:
+            self._step_turn(odom)
+            return
+        # When following is disabled the node stays quiet (a zero was already
+        # published at the moment of disabling).
+        if not self._following_enabled:
+            return
+
         if self.mode == 'carrot':
             self._control_step_carrot(odom)
             return
@@ -625,8 +764,12 @@ class WaypointFollower(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = WaypointFollower()
+    # MultiThreadedExecutor so the blocking ~/turn_in_place handler can wait
+    # while the odom callback keeps running the rotation on another thread.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
