@@ -32,6 +32,9 @@ from rclpy.time import Time
 from std_srvs.srv import SetBool, Trigger
 from whycode_interfaces.msg import MarkerArray
 
+# Minimum forward linear speed in carrot mode (m/s).
+_CARROT_MIN_LINEAR_V = 0.02
+
 
 def _best_effort(depth: int) -> QoSProfile:
     return QoSProfile(
@@ -139,7 +142,7 @@ class WaypointFollower(Node):
         self.declare_parameter('action_rotate_deg', 180.0)
         self.declare_parameter('turn_speed', 0.5)
         self.declare_parameter('turn_tolerance', 0.1)
-        self.declare_parameter('turn_timeout', 30.0)
+        self.declare_parameter('turn_timeout', 120.0)
 
         self.mode = str(self.get_parameter('mode').value).lower()
         if self.mode not in ('waypoints', 'carrot'):
@@ -320,7 +323,7 @@ class WaypointFollower(Node):
             self._turn_accumulated += abs(d)
             self._prev_turn_yaw = ryaw
 
-        if self._turn_accumulated >= self.turn_angle - self.turn_tolerance:
+        if abs(self._turn_accumulated) >= self.turn_angle - self.turn_tolerance:
             self._stop()
             self._turning = False
             self._turn_done_event.set()
@@ -679,8 +682,11 @@ class WaypointFollower(Node):
             # Marker lost: drive to the last known position, then rotate to
             # the last known marker yaw, then stop.
             if distance_to_target > self.goal_tolerance:
-                target_v = self._carrot_target_velocity(
-                    distance_to_target, heading_error)
+                target_v = max(
+                    self._carrot_target_velocity(
+                        distance_to_target, heading_error),
+                    _CARROT_MIN_LINEAR_V,
+                )
                 phase = 'LOST_APPROACH'
             else:
                 target_v = 0.0
@@ -701,6 +707,10 @@ class WaypointFollower(Node):
         # Apply linear slew limit so accel/decel never exceed the configured
         # rates, regardless of phase transitions.
         v_cmd = self._slew_linear(target_v, dt)
+        # Creep forward whenever we intend non-zero linear motion (e.g. marker
+        # lost and decel profile would otherwise command near-zero speed).
+        if target_v > 0.0 and 0.0 < v_cmd < _CARROT_MIN_LINEAR_V:
+            v_cmd = _CARROT_MIN_LINEAR_V
         self._prev_linear_cmd = v_cmd
 
         cmd = Twist()
