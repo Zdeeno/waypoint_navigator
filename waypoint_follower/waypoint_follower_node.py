@@ -34,6 +34,11 @@ from whycode_interfaces.msg import MarkerArray
 
 # Minimum forward linear speed in carrot mode (m/s).
 _CARROT_MIN_LINEAR_V = 0.02
+# Carrot phases that always command at least ``_CARROT_MIN_LINEAR_V`` forward.
+# Only ``LOST_DONE`` may stop (manoeuvre complete).
+_CARROT_MIN_LINEAR_PHASES = frozenset({
+    'WAIT', 'FOLLOW', 'HOLD', 'LOST_APPROACH', 'LOST_ALIGN',
+})
 
 
 def _best_effort(depth: int) -> QoSProfile:
@@ -608,6 +613,15 @@ class WaypointFollower(Node):
         step = min(self._prev_linear_cmd - target_v, self.linear_decel * dt)
         return self._prev_linear_cmd - step
 
+    def _enforce_carrot_linear_min(
+        self, target_v: float, v_cmd: float, phase: str
+    ) -> tuple[float, float]:
+        """Floor linear target and command except in ``LOST_DONE``."""
+        if phase in _CARROT_MIN_LINEAR_PHASES:
+            target_v = max(target_v, _CARROT_MIN_LINEAR_V)
+            v_cmd = max(v_cmd, _CARROT_MIN_LINEAR_V)
+        return target_v, v_cmd
+
     def _control_step_carrot(self, odom: Odometry) -> None:
         """Carrot mode: follow the latest marker at a fixed standoff.
 
@@ -621,13 +635,26 @@ class WaypointFollower(Node):
         accel/decel.
         """
         if self._carrot_pose is None or self._carrot_last_seen is None:
-            # No carrot yet — keep the slew state zeroed so we restart cleanly
-            # the moment a marker shows up.
-            self._prev_linear_cmd = 0.0
-            self._prev_cmd_time = None
-            self._stop()
+            phase = 'WAIT'
+            now = self.get_clock().now()
+            if self._prev_cmd_time is None:
+                dt = 0.0
+            else:
+                dt = (now - self._prev_cmd_time).nanoseconds * 1e-9
+                if dt < 0.0:
+                    dt = 0.0
+            self._prev_cmd_time = now
+            target_v = _CARROT_MIN_LINEAR_V
+            target_v, _ = self._enforce_carrot_linear_min(target_v, target_v, phase)
+            v_cmd = self._slew_linear(target_v, dt)
+            _, v_cmd = self._enforce_carrot_linear_min(target_v, v_cmd, phase)
+            self._prev_linear_cmd = v_cmd
+            cmd = Twist()
+            cmd.linear.x = v_cmd
+            self._publish_cmd(cmd)
             self.get_logger().info(
-                f'[ctrl/carrot] WAIT: no marker seen yet on {self.marker_topic}',
+                f'[ctrl/carrot:{phase}] PUB cmd_vel lin={cmd.linear.x:+.3f} '
+                f'| no marker seen yet on {self.marker_topic}',
                 throttle_duration_sec=2.0)
             return
 
@@ -682,11 +709,8 @@ class WaypointFollower(Node):
             # Marker lost: drive to the last known position, then rotate to
             # the last known marker yaw, then stop.
             if distance_to_target > self.goal_tolerance:
-                target_v = max(
-                    self._carrot_target_velocity(
-                        distance_to_target, heading_error),
-                    _CARROT_MIN_LINEAR_V,
-                )
+                target_v = self._carrot_target_velocity(
+                    distance_to_target, heading_error)
                 phase = 'LOST_APPROACH'
             else:
                 target_v = 0.0
@@ -704,13 +728,11 @@ class WaypointFollower(Node):
                     target_w = 0.0
                     phase = 'LOST_DONE'
 
+        target_v, _ = self._enforce_carrot_linear_min(target_v, target_v, phase)
         # Apply linear slew limit so accel/decel never exceed the configured
         # rates, regardless of phase transitions.
         v_cmd = self._slew_linear(target_v, dt)
-        # Creep forward whenever we intend non-zero linear motion (e.g. marker
-        # lost and decel profile would otherwise command near-zero speed).
-        if target_v > 0.0 and 0.0 < v_cmd < _CARROT_MIN_LINEAR_V:
-            v_cmd = _CARROT_MIN_LINEAR_V
+        target_v, v_cmd = self._enforce_carrot_linear_min(target_v, v_cmd, phase)
         self._prev_linear_cmd = v_cmd
 
         cmd = Twist()
