@@ -31,15 +31,11 @@ waypoint_follower:
     # Hold this many metres from the marker; never drive closer, never back up.
     desired_carrot_distance: 2.0
     # Marker detection-age beyond which the marker is treated as lost; on
-    # loss the robot drives to the last known position then aligns to the
-    # last known marker yaw.
-    marker_timeout: 1.0
-    # Yaw tolerance (rad) when finishing the lost-marker manoeuvre.
-    final_yaw_tolerance: 0.1
-    # Linear-velocity slew limits (m/s^2). linear_decel also drives the
-    # physics-correct stopping profile near the standoff:
-    # v_target = sqrt(2 * linear_decel * gap). Lower values = gentler ramps.
-    # With desired_linear_velocity=3.0 and linear_accel=0.6, going 0->3 m/s
-    # takes ~5 s and ~7.5 m. linear_decel=0.4 stops from 3 m/s in ~11 m.
-    linear_accel: 0.6
-    linear_decel: 0.4
+    # loss the robot dead-reckons along the last base-frame range/bearing at
+    # least lost_speed (m/s).
+    marker_timeout: 0.2
+    lost_speed: 0.75
+    # Carrot speed shaping (see helhest/taros waypoint_follower.yaml).
+    linear_accel: 0.25
+    linear_decel: 0.2
+    linear_slew_ref: 0.5

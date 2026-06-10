@@ -7,9 +7,8 @@ Two control modes, selectable via the ``mode`` parameter:
   geometry_msgs/TwistStamped to cmd_vel using a simple follow-the-carrot rule.
 * ``carrot`` — locks on to a single marker and follows it like a carrot,
   maintaining ``desired_carrot_distance`` at all times (never backs up). If
-  the marker disappears for longer than ``marker_timeout``, drives to the
-  last known marker position, rotates to the last known marker yaw, and
-  stops.
+  the marker disappears for longer than ``marker_timeout``, dead-reckons
+  along the last base-frame bearing and distance at ``lost_speed``.
 
 In either mode, each odometry message triggers one control tick (compute the
 command, publish a TwistStamped), so the command rate matches the odom rate
@@ -17,28 +16,22 @@ and the command always uses the freshest pose.
 """
 
 import math
-import threading
 from collections import deque
 from typing import Deque, Optional
 
 import rclpy
 from geometry_msgs.msg import Pose, PoseStamped, Twist, TwistStamped
 from nav_msgs.msg import Odometry, Path
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
-from std_srvs.srv import SetBool, Trigger
+from std_srvs.srv import SetBool
 from whycode_interfaces.msg import MarkerArray
 
-# Minimum forward linear speed in carrot mode (m/s).
+# Minimum forward linear speed in carrot mode while moving (m/s).
 _CARROT_MIN_LINEAR_V = 0.02
-# Carrot phases that always command at least ``_CARROT_MIN_LINEAR_V`` forward.
-# Only ``LOST_DONE`` may stop (manoeuvre complete).
-_CARROT_MIN_LINEAR_PHASES = frozenset({
-    'WAIT', 'FOLLOW', 'HOLD', 'LOST_APPROACH', 'LOST_ALIGN',
-})
+# Phases that enforce ``_CARROT_MIN_LINEAR_V`` (HOLD and LOST_DONE may stop).
+_CARROT_MIN_LINEAR_PHASES = frozenset({'WAIT', 'FOLLOW'})
 
 
 def _best_effort(depth: int) -> QoSProfile:
@@ -126,28 +119,24 @@ class WaypointFollower(Node):
         self.declare_parameter('desired_carrot_distance', 1.5)
         # Time without any marker detection before the marker is treated as
         # lost and we switch to "go to last known position" behaviour.
-        self.declare_parameter('marker_timeout', 1.0)
-        # Yaw tolerance (rad) when aligning to the last known marker yaw
-        # after the marker is lost — below this we declare the manoeuvre done.
-        self.declare_parameter('final_yaw_tolerance', 0.1)
-        # Linear velocity slew limits for the carrot mode (m/s^2). ``decel``
-        # also drives the physics-correct stopping profile near the standoff
-        # (v_target = sqrt(2 * decel * gap)).
-        self.declare_parameter('linear_accel', 0.5)
-        self.declare_parameter('linear_decel', 0.3)
+        self.declare_parameter('marker_timeout', 0.2)
+        # Linear speed floor (m/s) while dead-reckoning after marker loss.
+        self.declare_parameter('lost_speed', 0.75)
+        # Carrot linear-velocity shaping. ``linear_decel`` drives the
+        # physics-correct stopping profile near the standoff
+        # (v_target = sqrt(2 * decel * gap)). ``linear_accel`` /
+        # ``linear_decel`` also scale the log-based slew toward the target
+        # command (larger |target - current| → larger per-tick change;
+        # near the target the step shrinks). ``linear_slew_ref`` sets the
+        # speed scale inside log1p(|delta| / ref).
+        self.declare_parameter('linear_accel', 0.3)
+        self.declare_parameter('linear_decel', 0.2)
+        self.declare_parameter('linear_slew_ref', 0.5)
 
         # Whether marker following is active at startup. The ELROB mission
         # launches with this False so the robot does nothing until the
         # operator's mission node enables it; standalone/sim use keeps True.
         self.declare_parameter('enabled_on_start', True)
-        # In-place turn (``~/turn_in_place`` service) dynamics. Robot-side,
-        # closed-loop on odom: rotate by ``action_rotate_deg`` (degrees) at
-        # ``turn_speed`` (sign sets direction) until within ``turn_tolerance``
-        # (rad), aborting after ``turn_timeout`` seconds.
-        self.declare_parameter('action_rotate_deg', 180.0)
-        self.declare_parameter('turn_speed', 0.5)
-        self.declare_parameter('turn_tolerance', 0.1)
-        self.declare_parameter('turn_timeout', 120.0)
 
         self.mode = str(self.get_parameter('mode').value).lower()
         if self.mode not in ('waypoints', 'carrot'):
@@ -175,17 +164,11 @@ class WaypointFollower(Node):
         self.desired_carrot_distance = float(
             self.get_parameter('desired_carrot_distance').value)
         self.marker_timeout = float(self.get_parameter('marker_timeout').value)
-        self.final_yaw_tolerance = float(
-            self.get_parameter('final_yaw_tolerance').value)
+        self.lost_speed = float(self.get_parameter('lost_speed').value)
         self.linear_accel = max(1e-3, float(self.get_parameter('linear_accel').value))
         self.linear_decel = max(1e-3, float(self.get_parameter('linear_decel').value))
-        # action_rotate_deg is configured in degrees; keep a radian working
-        # value for the odom-based comparison.
-        self.action_rotate_deg = float(self.get_parameter('action_rotate_deg').value)
-        self.turn_angle = math.radians(self.action_rotate_deg)
-        self.turn_speed = float(self.get_parameter('turn_speed').value)
-        self.turn_tolerance = float(self.get_parameter('turn_tolerance').value)
-        self.turn_timeout = float(self.get_parameter('turn_timeout').value)
+        self.linear_slew_ref = max(1e-3, float(
+            self.get_parameter('linear_slew_ref').value))
 
         self.waypoint_buffer: Deque[PoseStamped] = deque()
         # Position of the last waypoint we accepted into the buffer (kept
@@ -208,11 +191,22 @@ class WaypointFollower(Node):
         # its yaw, and the wall-clock time of the last detection. ``None``
         # until the first marker is seen.
         self._carrot_pose: Optional[Pose] = None
-        self._carrot_yaw: float = 0.0
         self._carrot_last_seen: Optional[Time] = None
-        # Slew-rate state for the carrot linear-velocity controller. We
-        # remember the last commanded linear velocity and the time it was
-        # published so we can clamp |dv/dt| to ``linear_accel`` / ``linear_decel``.
+        # Latest marker bearing (rad) and range (m) in base_link, updated on
+        # each detection and locked when the marker is declared lost.
+        self._last_marker_base_bearing: float = 0.0
+        self._last_marker_base_distance: float = 0.0
+        # Dead-reckoning state after marker loss: drive ``_lost_drive_target``
+        # metres while accumulating ``_lost_turn_target`` radians of yaw.
+        self._lost_maneuver_active: bool = False
+        self._lost_drive_target: float = 0.0
+        self._lost_turn_target: float = 0.0
+        self._lost_driven: float = 0.0
+        self._lost_turned: float = 0.0
+        self._prev_lost_odom_pose: Optional[Pose] = None
+        # Slew state for the carrot linear-velocity controller. We remember
+        # the last commanded linear velocity and tick time so log-scaled slew
+        # can smooth transitions toward each target speed.
         self._prev_linear_cmd: float = 0.0
         self._prev_cmd_time: Optional[Time] = None
 
@@ -220,26 +214,11 @@ class WaypointFollower(Node):
         # the ELROB mission node gates following this way.
         self._following_enabled = bool(self.get_parameter('enabled_on_start').value)
 
-        # In-place turn state. The blocking ~/turn_in_place service handler
-        # waits on _turn_done_event while the odom-driven control path runs
-        # the rotation and sets the event on completion.
-        self._turning = False
-        self._turn_accumulated = 0.0
-        self._prev_turn_yaw: Optional[float] = None
-        self._turn_done_event = threading.Event()
-
-        # Odom/control run in their own mutually-exclusive group; the turn
-        # service is reentrant so it can block on the event while the odom
-        # callback keeps firing (requires the MultiThreadedExecutor in main).
-        self._odom_cbg = MutuallyExclusiveCallbackGroup()
-        self._turn_cbg = ReentrantCallbackGroup()
-
         self.create_subscription(
             MarkerArray, self.marker_topic, self._marker_callback,
             WAYPOINT_QOS)
         self.create_subscription(
-            Odometry, self.odom_topic, self._odom_callback, ODOM_QOS,
-            callback_group=self._odom_cbg)
+            Odometry, self.odom_topic, self._odom_callback, ODOM_QOS)
 
         self.cmd_vel_pub = self.create_publisher(
             TwistStamped, self.cmd_vel_topic, CMD_VEL_QOS)
@@ -248,9 +227,6 @@ class WaypointFollower(Node):
 
         self.enable_following_srv = self.create_service(
             SetBool, '~/enable_following', self._enable_following_cb)
-        self.turn_in_place_srv = self.create_service(
-            Trigger, '~/turn_in_place', self._turn_in_place_cb,
-            callback_group=self._turn_cbg)
 
         self.get_logger().info(
             f'waypoint_follower ready (mode={self.mode!r}, '
@@ -261,7 +237,7 @@ class WaypointFollower(Node):
             f'  cmd_vel (TwistStamped)   -> {self.cmd_vel_topic} '
             f'(frame_id={self.cmd_vel_frame_id!r})\n'
             f'  path (Path)              -> {self.path_topic}\n'
-            f'  services: ~/enable_following (SetBool), ~/turn_in_place (Trigger)')
+            f'  services: ~/enable_following (SetBool)')
 
     def _enable_following_cb(self, request: SetBool.Request,
                              response: SetBool.Response) -> SetBool.Response:
@@ -271,6 +247,7 @@ class WaypointFollower(Node):
             self._stop()
             self._carrot_pose = None
             self._carrot_last_seen = None
+            self._reset_lost_maneuver()
             self._last_accepted_wp_pose = None
             self.waypoint_buffer.clear()
             self._integrated_distance = 0.0
@@ -282,66 +259,8 @@ class WaypointFollower(Node):
         self.get_logger().info(f'[srv] {response.message}')
         return response
 
-    def _turn_in_place_cb(self, request: Trigger.Request,
-                          response: Trigger.Response) -> Trigger.Response:
-        """Blocking 180°-style turn. Kicks off the odom-driven rotation and
-        waits for it to finish (or time out). Runs in a reentrant group so the
-        odom callback keeps firing while we wait."""
-        if self._latest_odom_pose is None:
-            response.success = False
-            response.message = f'no odometry yet on {self.odom_topic}'
-            self.get_logger().warn(f'[turn] reject: {response.message}')
-            return response
-        # Arm the turn; the control path picks it up on the next odom message.
-        self._turn_accumulated = 0.0
-        self._prev_turn_yaw = None
-        self._turn_done_event.clear()
-        self._turning = True
-        self.get_logger().info(
-            f'[turn] start: rotating {self.action_rotate_deg:.0f}deg '
-            f'at {self.turn_speed:+.2f} rad/s')
-        completed = self._turn_done_event.wait(timeout=self.turn_timeout)
-        if not completed:
-            self._turning = False
-            self._stop()
-            response.success = False
-            response.message = (
-                f'turn timed out after {self.turn_timeout:.1f}s '
-                f'({math.degrees(self._turn_accumulated):.0f}deg of '
-                f'{self.action_rotate_deg:.0f}deg)')
-            self.get_logger().warn(f'[turn] {response.message}')
-            return response
-        response.success = True
-        response.message = f'turn complete ({math.degrees(self._turn_accumulated):.0f}deg)'
-        self.get_logger().info(f'[turn] {response.message}')
-        return response
-
-    def _step_turn(self, odom: Odometry) -> None:
-        """Integrate wrapped yaw delta and rotate at turn_speed until the
-        target angle is reached, then stop and signal the service handler."""
-        ryaw = yaw_from_quaternion(odom.pose.pose.orientation)
-        if self._prev_turn_yaw is None:
-            self._prev_turn_yaw = ryaw
-        else:
-            d = math.atan2(math.sin(ryaw - self._prev_turn_yaw),
-                           math.cos(ryaw - self._prev_turn_yaw))
-            self._turn_accumulated += abs(d)
-            self._prev_turn_yaw = ryaw
-
-        if abs(self._turn_accumulated) >= self.turn_angle - self.turn_tolerance:
-            self._stop()
-            self._turning = False
-            self._turn_done_event.set()
-            return
-
-        cmd = Twist()
-        cmd.angular.z = self.turn_speed
-        self._publish_cmd(cmd)
-
     def _marker_callback(self, msg: MarkerArray) -> None:
-        # Ignore markers while following is disabled or an in-place turn is
-        # in progress — nothing should lock on or drive in those states.
-        if not self._following_enabled or self._turning:
+        if not self._following_enabled:
             return
         # Whycode (and our test bag-replay) publishes detected markers in the
         # camera frame, treated as base_link by project assumption. We lift
@@ -366,7 +285,7 @@ class WaypointFollower(Node):
         # Selection: at start-up we require an unambiguous single marker;
         # once tracking has begun, pick the marker closest (in odom) to the
         # last lock-on reference to stay on the same physical fiducial.
-        candidates = [transform_base_to_odom(m.position, self._latest_odom_pose)
+        candidates = [(transform_base_to_odom(m.position, self._latest_odom_pose), m)
                       for m in msg.markers]
         if lock_ref is None:
             if len(candidates) != 1:
@@ -375,15 +294,21 @@ class WaypointFollower(Node):
                     f'need exactly 1 to lock on',
                     throttle_duration_sec=2.0)
                 return
-            chosen = candidates[0]
+            chosen, chosen_marker = candidates[0]
         else:
-            chosen = min(candidates,
-                         key=lambda p: euclidean_distance(p, lock_ref))
+            chosen, chosen_marker = min(
+                candidates,
+                key=lambda pair: euclidean_distance(pair[0], lock_ref))
 
         if self.mode == 'carrot':
+            mx = chosen_marker.position.position.x
+            my = chosen_marker.position.position.y
+            self._last_marker_base_bearing = math.atan2(my, mx)
+            self._last_marker_base_distance = math.hypot(mx, my)
             self._carrot_pose = chosen
-            self._carrot_yaw = yaw_from_quaternion(chosen.orientation)
             self._carrot_last_seen = self.get_clock().now()
+            self._lost_maneuver_active = False
+            self._prev_lost_odom_pose = None
             self._publish_carrot_path()
             return
 
@@ -466,11 +391,6 @@ class WaypointFollower(Node):
         self._publish_cmd(Twist())
 
     def _control_step(self, odom: Odometry) -> None:
-        # An in-place turn takes precedence over everything and runs
-        # independently of the following-enabled flag.
-        if self._turning:
-            self._step_turn(odom)
-            return
         # When following is disabled the node stays quiet (a zero was already
         # published at the moment of disabling).
         if not self._following_enabled:
@@ -603,36 +523,96 @@ class WaypointFollower(Node):
         return v * max(0.0, math.cos(heading_error))
 
     def _slew_linear(self, target_v: float, dt: float) -> float:
-        """Clamp |dv/dt| to ``linear_accel`` (speeding up) or
-        ``linear_decel`` (slowing down), starting from ``_prev_linear_cmd``."""
+        """Move ``_prev_linear_cmd`` toward ``target_v`` with log-scaled steps.
+
+        step = rate * dt * log1p(|target - current| / linear_slew_ref),
+        capped at |target - current|. A large speed gap produces a larger
+        per-tick change; near the target the step shrinks for a soft landing.
+        ``linear_accel`` scales steps when speeding up; ``linear_decel`` when
+        slowing down.
+        """
         if dt <= 0.0:
             return self._prev_linear_cmd
-        if target_v > self._prev_linear_cmd:
-            step = min(target_v - self._prev_linear_cmd, self.linear_accel * dt)
-            return self._prev_linear_cmd + step
-        step = min(self._prev_linear_cmd - target_v, self.linear_decel * dt)
-        return self._prev_linear_cmd - step
+
+        delta = target_v - self._prev_linear_cmd
+        if abs(delta) < 1e-9:
+            return self._prev_linear_cmd
+
+        rate = self.linear_accel if delta > 0.0 else self.linear_decel
+        step = rate * dt * math.log1p(abs(delta) / self.linear_slew_ref)
+        step = min(abs(delta), step)
+        return self._prev_linear_cmd + math.copysign(step, delta)
+
+    def _reset_lost_maneuver(self) -> None:
+        self._lost_maneuver_active = False
+        self._lost_drive_target = 0.0
+        self._lost_turn_target = 0.0
+        self._lost_driven = 0.0
+        self._lost_turned = 0.0
+        self._prev_lost_odom_pose = None
+
+    def _arm_lost_maneuver(self, robot_pose: Pose) -> None:
+        """Lock base-frame range/bearing and reset dead-reckoning integrators."""
+        self._lost_maneuver_active = True
+        self._lost_drive_target = self._last_marker_base_distance
+        self._lost_turn_target = self._last_marker_base_bearing
+        self._lost_driven = 0.0
+        self._lost_turned = 0.0
+        self._prev_lost_odom_pose = robot_pose
+
+    def _integrate_lost_maneuver(self, robot_pose: Pose) -> None:
+        if self._prev_lost_odom_pose is None:
+            self._prev_lost_odom_pose = robot_pose
+            return
+
+        prev_yaw = yaw_from_quaternion(self._prev_lost_odom_pose.orientation)
+        ryaw = yaw_from_quaternion(robot_pose.orientation)
+        dx = robot_pose.position.x - self._prev_lost_odom_pose.position.x
+        dy = robot_pose.position.y - self._prev_lost_odom_pose.position.y
+        self._lost_driven += dx * math.cos(prev_yaw) + dy * math.sin(prev_yaw)
+        self._lost_turned += math.atan2(
+            math.sin(ryaw - prev_yaw), math.cos(ryaw - prev_yaw))
+        self._prev_lost_odom_pose = robot_pose
+
+    def _lost_maneuver_remaining_distance(self) -> float:
+        return self._lost_drive_target - self._lost_driven
+
+    def _lost_maneuver_angular(self, linear_v: float) -> float:
+        """Constant-curvature ω for the remaining dead-reckoning segment."""
+        remaining_dist = self._lost_maneuver_remaining_distance()
+        if remaining_dist <= 1e-3:
+            return 0.0
+        remaining_turn = self._lost_turn_target - self._lost_turned
+        target_w = linear_v * (remaining_turn / remaining_dist)
+        return max(
+            -self.max_angular_velocity,
+            min(self.max_angular_velocity, target_w),
+        )
 
     def _enforce_carrot_linear_min(
         self, target_v: float, v_cmd: float, phase: str
     ) -> tuple[float, float]:
-        """Floor linear target and command except in ``LOST_DONE``."""
+        """Floor linear target/command while moving; HOLD and LOST_DONE may stop."""
         if phase in _CARROT_MIN_LINEAR_PHASES:
             target_v = max(target_v, _CARROT_MIN_LINEAR_V)
             v_cmd = max(v_cmd, _CARROT_MIN_LINEAR_V)
+        elif phase == 'LOST_APPROACH':
+            target_v = max(target_v, self.lost_speed)
+            v_cmd = max(v_cmd, self.lost_speed)
         return target_v, v_cmd
 
     def _control_step_carrot(self, odom: Odometry) -> None:
         """Carrot mode: follow the latest marker at a fixed standoff.
 
         While the marker is visible, hold ``desired_carrot_distance`` (never
-        drive closer, never back up). If the marker is lost for longer than
-        ``marker_timeout``, drive to the last known marker position, rotate
-        to the last known marker yaw, then stop.
+        drive closer, never back up). At standoff the robot stops completely
+        (no in-place rotation). If the marker is lost for longer than
+        ``marker_timeout``, dead-reckons along the last base-frame range and
+        bearing at a minimum speed of ``lost_speed``.
 
-        Linear velocity is shaped by a sqrt(2·decel·gap) profile and then
-        slew-limited by ``linear_accel`` / ``linear_decel`` for smooth
-        accel/decel.
+        Linear velocity is shaped by a sqrt(2·decel·gap) profile while
+        following, then slewed toward that target with log-scaled steps
+        (``linear_accel`` / ``linear_decel``, ``linear_slew_ref``).
         """
         if self._carrot_pose is None or self._carrot_last_seen is None:
             phase = 'WAIT'
@@ -675,6 +655,11 @@ class WaypointFollower(Node):
         age_s = (now - self._carrot_last_seen).nanoseconds * 1e-9
         marker_lost = age_s > self.marker_timeout
 
+        if marker_lost and not self._lost_maneuver_active:
+            self._arm_lost_maneuver(robot_pose)
+        elif marker_lost and self._lost_maneuver_active:
+            self._integrate_lost_maneuver(robot_pose)
+
         if self._prev_cmd_time is None:
             dt = 0.0
         else:
@@ -691,10 +676,7 @@ class WaypointFollower(Node):
         heading_error = math.atan2(
             math.sin(bearing - ryaw), math.cos(bearing - ryaw))
 
-        target_w = max(
-            -self.max_angular_velocity,
-            min(self.max_angular_velocity, self.angular_gain * heading_error),
-        )
+        target_w = 0.0
 
         if not marker_lost:
             # Marker visible: stop at the standoff (never closer, never back).
@@ -702,38 +684,54 @@ class WaypointFollower(Node):
             if gap > 0.0:
                 target_v = self._carrot_target_velocity(gap, heading_error)
                 phase = 'FOLLOW'
+                target_w = max(
+                    -self.max_angular_velocity,
+                    min(self.max_angular_velocity,
+                        self.angular_gain * heading_error),
+                )
             else:
                 target_v = 0.0
                 phase = 'HOLD'
+        elif self._lost_maneuver_remaining_distance() > self.goal_tolerance:
+            target_v = self.lost_speed
+            phase = 'LOST_APPROACH'
         else:
-            # Marker lost: drive to the last known position, then rotate to
-            # the last known marker yaw, then stop.
-            if distance_to_target > self.goal_tolerance:
-                target_v = self._carrot_target_velocity(
-                    distance_to_target, heading_error)
-                phase = 'LOST_APPROACH'
-            else:
-                target_v = 0.0
-                yaw_error = math.atan2(
-                    math.sin(self._carrot_yaw - ryaw),
-                    math.cos(self._carrot_yaw - ryaw))
-                if abs(yaw_error) > self.final_yaw_tolerance:
-                    target_w = max(
-                        -self.max_angular_velocity,
-                        min(self.max_angular_velocity,
-                            self.angular_gain * yaw_error),
-                    )
-                    phase = 'LOST_ALIGN'
-                else:
-                    target_w = 0.0
-                    phase = 'LOST_DONE'
+            target_v = 0.0
+            phase = 'LOST_DONE'
+
+        if phase in ('HOLD', 'LOST_DONE'):
+            self._prev_linear_cmd = 0.0
+            cmd = Twist()
+            self._publish_cmd(cmd)
+            rx = robot_pose.position.x
+            ry = robot_pose.position.y
+            tx = target.position.x
+            ty = target.position.y
+            self.get_logger().info(
+                f'[ctrl/carrot:{phase}] PUB cmd_vel lin=+0.000 ang=+0.000 '
+                f'| robot=({rx:.2f},{ry:.2f}) yaw={math.degrees(ryaw):+.1f}deg '
+                f'| target=({tx:.2f},{ty:.2f}) '
+                f'| dist={distance_to_target:.2f} '
+                f'standoff={self.desired_carrot_distance:.2f} '
+                f'marker_age={age_s:.2f}s lost={marker_lost} '
+                f'lost_driven={self._lost_driven:.2f}/'
+                f'{self._lost_drive_target:.2f} '
+                f'lost_turn={math.degrees(self._lost_turned):+.1f}/'
+                f'{math.degrees(self._lost_turn_target):+.1f}deg '
+                f'subs={self.cmd_vel_pub.get_subscription_count()}')
+            return
 
         target_v, _ = self._enforce_carrot_linear_min(target_v, target_v, phase)
-        # Apply linear slew limit so accel/decel never exceed the configured
-        # rates, regardless of phase transitions.
         v_cmd = self._slew_linear(target_v, dt)
         target_v, v_cmd = self._enforce_carrot_linear_min(target_v, v_cmd, phase)
         self._prev_linear_cmd = v_cmd
+
+        if phase == 'LOST_APPROACH':
+            target_w = self._lost_maneuver_angular(v_cmd)
+        elif phase == 'FOLLOW':
+            pass  # target_w already set above
+        else:
+            target_w = 0.0
 
         cmd = Twist()
         cmd.linear.x = v_cmd
@@ -754,6 +752,10 @@ class WaypointFollower(Node):
             f'| dist={distance_to_target:.2f} '
             f'standoff={self.desired_carrot_distance:.2f} '
             f'marker_age={age_s:.2f}s lost={marker_lost} '
+            f'lost_driven={self._lost_driven:.2f}/'
+            f'{self._lost_drive_target:.2f} '
+            f'lost_turn={math.degrees(self._lost_turned):+.1f}/'
+            f'{math.degrees(self._lost_turn_target):+.1f}deg '
             f'subs={self.cmd_vel_pub.get_subscription_count()}')
 
         self._publish_cmd(cmd)
@@ -796,12 +798,8 @@ class WaypointFollower(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = WaypointFollower()
-    # MultiThreadedExecutor so the blocking ~/turn_in_place handler can wait
-    # while the odom callback keeps running the rotation on another thread.
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
