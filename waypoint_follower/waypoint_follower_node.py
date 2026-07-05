@@ -286,7 +286,9 @@ class WaypointFollower(Node):
         # once tracking has begun, pick the marker closest (in odom) to the
         # last lock-on reference to stay on the same physical fiducial.
         candidates = [(transform_base_to_odom(m.position, self._latest_odom_pose), m)
-                      for m in msg.markers]
+                      for m in msg.markers if m.id == 1]
+        if not candidates:
+            return
         if lock_ref is None:
             if len(candidates) != 1:
                 self.get_logger().info(
